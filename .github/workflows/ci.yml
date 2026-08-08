@@ -12,7 +12,7 @@ on:
       context:
         description: 'Context size (4096-131072)'
         required: false
-        default: '65536'
+        default: '32768'
         type: string
       session_timeout_minutes:
         description: 'Session timeout in minutes (5-360)'
@@ -1394,8 +1394,8 @@ jobs:
             "--cache-type-v", "q8_0",
             "--flash-attn", "on",
             "--parallel", "1",
-            "--batch-size", "512",
-            "--ubatch-size", "256",
+            "--batch-size", "256",
+            "--ubatch-size", "128",
             "--no-warmup"
           )
 
@@ -1526,27 +1526,51 @@ jobs:
             temperature = 0.1
           } | ConvertTo-Json -Depth 10
 
-          try {
-            $response = Invoke-RestMethod `
-              -Uri "http://127.0.0.1:$env:LLAMA_PORT/v1/chat/completions" `
-              -Method Post `
-              -ContentType "application/json" `
-              -Body $body `
-              -TimeoutSec 300
+          $testResult = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              if ($attempt -gt 1) {
+                Write-Host "Retrying API test (attempt $attempt)..."
+                Start-Sleep 15
+              }
+              $response = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:$env:LLAMA_PORT/v1/chat/completions" `
+                -Method Post `
+                -ContentType "application/json" `
+                -Body $body `
+                -TimeoutSec 300
+              $testResult = $response
+              break
+            }
+            catch {
+              Write-Host "API test attempt $attempt failed: $($_.Exception.Message)"
+              if (Test-Path "$env:RUNNER_TEMP\llama-server-error.log") {
+                Get-Content "$env:RUNNER_TEMP\llama-server-error.log" -Tail 15 -ErrorAction SilentlyContinue
+              }
+            }
+          }
 
+          if ($testResult) {
             Write-Host ""
             Write-Host "MODEL RESPONSE:"
-            Write-Host $response.choices[0].message.content
+            Write-Host $testResult.choices[0].message.content
             Write-Host ""
             Write-Host "✓ API TEST PASSED"
           }
-          catch {
+          else {
             Write-Host ""
             Write-Host "===== SERVER ERROR ====="
             if (Test-Path "$env:RUNNER_TEMP\llama-server-error.log") {
-              Get-Content "$env:RUNNER_TEMP\llama-server-error.log" -Tail 20 -ErrorAction SilentlyContinue
+              Get-Content "$env:RUNNER_TEMP\llama-server-error.log" -Tail 30 -ErrorAction SilentlyContinue
             }
-            throw "API test failed: $_"
+            if (Get-Process -Id $env:LLAMA_PID -ErrorAction SilentlyContinue) {
+              Write-Host "Server process still running (may be slow on first request)"
+              throw "API test failed after 3 attempts - server unresponsive"
+            }
+            else {
+              Write-Host "Server process exited (check logs above for crash reason)"
+              throw "API test failed: server process is not running"
+            }
           }
 
       # ────────────────────────────────────────────────────────
