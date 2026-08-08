@@ -1192,7 +1192,7 @@ jobs:
             "--threads-batch", "$threads",
             "--cache-type-k", "q8_0",
             "--cache-type-v", "q8_0",
-            "--flash-attn",
+            "--flash-attn", "on",
             "--parallel", "1",
             "--batch-size", "512",
             "--ubatch-size", "256",
