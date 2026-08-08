@@ -759,7 +759,6 @@ jobs:
       RDP_PORT: '3389'
       LLAMA_PORT: '8080'
       RPC_PORT: '50052'
-      LOCAL_RPC_PORT: '50051'
       TAILSCALE_HOSTNAME: 'llama-main-${{ github.run_id }}'
       RPC_HOSTNAME: 'llama-rpc-${{ github.run_id }}'
       RDP_FIREWALL_RULE: 'RDP-Tailscale'
@@ -1200,49 +1199,6 @@ jobs:
           Write-Host ""
 
       # ────────────────────────────────────────────────────────
-      # START LOCAL RPC SERVER (MAIN NODE)
-      # The main node also registers as an RPC device so that
-      # --tensor-split 1,1 distributes between two machines.
-      # ────────────────────────────────────────────────────────
-      - name: Start Local RPC Server
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $rpcServerExe = Get-ChildItem `
-            -Path $env:LLAMA_DIR `
-            -Filter "*rpc-server*" `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if (-not $rpcServerExe) {
-            throw "ggml-rpc-server not found in $env:LLAMA_DIR"
-          }
-
-          $threads = [int]$env:NUMBER_OF_PROCESSORS
-          if ($threads -lt 1) { $threads = 2 }
-
-          $process = Start-Process `
-            -FilePath $rpcServerExe.FullName `
-            -ArgumentList "--host", "0.0.0.0", "--port", "$env:LOCAL_RPC_PORT", "--threads", "$threads" `
-            -WorkingDirectory $env:LLAMA_DIR `
-            -WindowStyle Hidden `
-            -PassThru
-
-          "LOCAL_RPC_PID=$($process.Id)" | Out-File `
-            $env:GITHUB_ENV `
-            -Append `
-            -Encoding UTF8
-
-          Start-Sleep 5
-
-          if ($process.HasExited) {
-            throw "Local RPC server exited with code: $($process.ExitCode)"
-          }
-
-          Write-Host "✓ Main node RPC server running on port $env:LOCAL_RPC_PORT (PID $($process.Id))"
-
-      # ────────────────────────────────────────────────────────
       # DISCOVER RPC WORKER
       # ────────────────────────────────────────────────────────
       - name: Discover RPC Worker
@@ -1369,7 +1325,7 @@ jobs:
           Write-Host "================================================"
           Write-Host "Model:         $env:LLAMA_MODEL_PATH"
           Write-Host "Context:       $env:LLAMA_CONTEXT"
-          Write-Host "RPC devices:   127.0.0.1:$env:LOCAL_RPC_PORT, $env:RPC_IP`:$env:RPC_PORT"
+          Write-Host "RPC devices:   $env:RPC_IP`:$env:RPC_PORT (worker)"
           Write-Host "Threads:       $threads"
           Write-Host "Tensor split:  1,1 (equal distribution)"
           Write-Host "KV Cache K:    q8_0"
@@ -1386,8 +1342,7 @@ jobs:
             "--port", "$env:LLAMA_PORT",
             "--ctx-size", "$env:LLAMA_CONTEXT",
             "--n-gpu-layers", "999",
-            "--rpc", "127.0.0.1:$env:LOCAL_RPC_PORT,$env:RPC_IP`:$env:RPC_PORT",
-            "--tensor-split", "1,1",
+            "--rpc", "$env:RPC_IP`:$env:RPC_PORT",
             "--threads", "$threads",
             "--threads-batch", "$threads",
             "--cache-type-k", "q8_0",
@@ -1789,16 +1744,6 @@ jobs:
           }
           catch {
             Write-Host "llama-server cleanup: $_"
-          }
-
-          try {
-            if ($env:LOCAL_RPC_PID) {
-              Stop-Process -Id $env:LOCAL_RPC_PID -Force -ErrorAction SilentlyContinue
-              Write-Host "✓ local RPC server stopped"
-            }
-          }
-          catch {
-            Write-Host "local RPC cleanup: $_"
           }
 
           try {
