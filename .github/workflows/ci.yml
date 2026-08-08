@@ -1,48 +1,1599 @@
-name: CI
+name: Secure RDP with Distributed llama.cpp
+run-name: Distributed llama.cpp RDP - ${{ github.actor }} - ${{ github.run_id }}
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Hugging Face llama.cpp model (repo:quant)'
+        required: false
+        default: 'mradermacher/Qwen3.5-27B-Uncensored-GGUF:Q4_K_M'
+        type: string
+      context:
+        description: 'Context size (4096-131072)'
+        required: false
+        default: '65536'
+        type: string
+      session_timeout_minutes:
+        description: 'Session timeout in minutes (5-360)'
+        required: false
+        default: '360'
+        type: string
+      ngrok_auth_token:
+        description: 'ngrok authtoken (optional for direct access)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
-  backend:
-    name: Backend (Python)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: backend/requirements.txt
-      - name: Install dependencies
-        run: pip install -r backend/requirements.txt
-      - name: Syntax check
-        run: python -m compileall backend
-      - name: Run tests
-        run: |
-          if find backend -name "test_*.py" -o -name "*_test.py" | grep -q .; then
-            python -m pytest backend -q
-          else
-            echo "No tests found - skipping"
-          fi
+  # ═══════════════════════════════════════════════════════════════
+  # RPC WORKER
+  # This is the SECOND RDP machine.
+  # It exposes its CPU/RAM as a remote ggml device.
+  # llama-server on the main machine will send part of the
+  # model to this machine.
+  # ═══════════════════════════════════════════════════════════════
 
-  frontend:
-    name: Frontend (React/Vite)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
+  rpc-worker:
+    runs-on: windows-latest
+    timeout-minutes: 370
+
+    env:
+      RDP_USERNAME: 'RDP'
+      RDP_PORT: '3389'
+      RPC_PORT: '50052'
+      TAILSCALE_HOSTNAME: 'llama-rpc-${{ github.run_id }}'
+      RDP_FIREWALL_RULE: 'RDP-Tailscale'
+      RPC_FIREWALL_RULE: 'llama.cpp-RPC-Tailscale'
+      REMOTE_DESKTOP_SERVICE: 'TermService'
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - name: Install dependencies
-        run: npm ci
-      - name: Build (typecheck + bundle)
-        run: npm run build
+      # ────────────────────────────────────────────────────────
+      # SYSTEM INFORMATION
+      # ────────────────────────────────────────────────────────
+      - name: Show Worker Hardware
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " RPC WORKER HARDWARE"
+          Write-Host "=============================================="
+          
+          Get-CimInstance Win32_ComputerSystem | 
+            Select-Object NumberOfLogicalProcessors, TotalPhysicalMemory | 
+            Format-List
+          
+          Write-Host "CPU threads: $env:NUMBER_OF_PROCESSORS"
+          
+          $os = Get-CimInstance Win32_OperatingSystem
+          $totalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+          $freeGB = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+          
+          Write-Host "Total RAM: $totalGB GB"
+          Write-Host "Free RAM:  $freeGB GB"
+          Write-Host ""
+
+      # ────────────────────────────────────────────────────────
+      # RDP CONFIGURATION
+      # ────────────────────────────────────────────────────────
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          try {
+            Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name 'fDenyTSConnections' `
+              -Value 0 `
+              -Force
+
+            Enable-NetFirewallRule `
+              -DisplayGroup "Remote Desktop" `
+              -ErrorAction SilentlyContinue
+
+            Restart-Service `
+              -Name $env:REMOTE_DESKTOP_SERVICE `
+              -Force
+
+            Write-Host "✓ RDP enabled"
+          }
+          catch {
+            Write-Error "RDP configuration failed: $_"
+            exit 1
+          }
+
+      # ────────────────────────────────────────────────────────
+      # RDP USER CREATION
+      # ────────────────────────────────────────────────────────
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          try {
+            $upper   = [char[]](65..90)
+            $lower   = [char[]](97..122)
+            $numbers = [char[]](48..57)
+            $special = @('!', '@', '#', '$', '%', '^', '&', '*')
+            
+            $chars = @()
+            $chars += ($upper   | Get-Random -Count 4)
+            $chars += ($lower   | Get-Random -Count 4)
+            $chars += ($numbers | Get-Random -Count 4)
+            $chars += ($special | Get-Random -Count 4)
+            
+            $password = -join ($chars | Get-Random -Count 16)
+            $securePassword = ConvertTo-SecureString `
+              $password `
+              -AsPlainText `
+              -Force
+
+            $existing = Get-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -ErrorAction SilentlyContinue
+
+            if ($existing) {
+              Set-LocalUser `
+                -Name $env:RDP_USERNAME `
+                -Password $securePassword
+            }
+            else {
+              New-LocalUser `
+                -Name $env:RDP_USERNAME `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -ErrorAction Stop | Out-Null
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $env:RDP_USERNAME
+
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member $env:RDP_USERNAME
+            }
+
+            "RDP_WORKER_PASS=${password}" | Out-File `
+              $env:GITHUB_ENV `
+              -Append `
+              -Encoding UTF8
+
+            Write-Host "✓ RPC worker RDP user ready"
+          }
+          catch {
+            Write-Error "RDP user creation failed: $_"
+            exit 1
+          }
+
+      # ────────────────────────────────────────────────────────
+      # TAILSCALE INSTALLATION
+      # ────────────────────────────────────────────────────────
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $installer = "$env:TEMP\tailscale.msi"
+          $ProgressPreference = "SilentlyContinue"
+          
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          $p = Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($p.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code: $($p.ExitCode)"
+          }
+
+          Start-Sleep 5
+          Write-Host "✓ Tailscale installed"
+
+      - name: Connect Tailscale Worker
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          & $tailscale up `
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --hostname="$env:TAILSCALE_HOSTNAME" `
+            --accept-dns=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
+
+          $ip = $null
+          for ($i = 1; $i -le 30; $i++) {
+            $ip = (& $tailscale ip -4 2>$null).Trim()
+            if ($ip) { break }
+            Start-Sleep 2
+          }
+
+          if (-not $ip) {
+            throw "No Tailscale IPv4 address obtained"
+          }
+
+          "RPC_TAILSCALE_IP=${ip}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " RPC WORKER TAILSCALE"
+          Write-Host "=============================================="
+          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
+          Write-Host "IP:       $ip"
+          Write-Host "RPC:      ${ip}:$env:RPC_PORT"
+          Write-Host "=============================================="
+
+      # ────────────────────────────────────────────────────────
+      # FIREWALL CONFIGURATION
+      # ────────────────────────────────────────────────────────
+      - name: Configure Tailscale Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          netsh advfirewall firewall delete rule `
+            name="$env:RPC_FIREWALL_RULE" 2>$null
+          netsh advfirewall firewall delete rule `
+            name="$env:RDP_FIREWALL_RULE" 2>$null
+
+          netsh advfirewall firewall add rule `
+            name="$env:RPC_FIREWALL_RULE" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=$env:RPC_PORT `
+            remoteip=100.64.0.0/10 `
+            profile=any
+
+          netsh advfirewall firewall add rule `
+            name="$env:RDP_FIREWALL_RULE" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=$env:RDP_PORT `
+            remoteip=100.64.0.0/10 `
+            profile=any
+
+          Write-Host "✓ RPC restricted to Tailscale (100.64.0.0/10)"
+          Write-Host "✓ RDP restricted to Tailscale (100.64.0.0/10)"
+
+      # ────────────────────────────────────────────────────────
+      # LLAMA.CPP INSTALLATION VIA WINGET
+      # ────────────────────────────────────────────────────────
+      - name: Install llama.cpp via WinGet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Installing llama.cpp via WinGet..."
+          
+          $existingLlama = Get-Command llama -ErrorAction SilentlyContinue
+          if ($existingLlama) {
+            Write-Host "llama.cpp is already installed at: $($existingLlama.Source)"
+            $llamaPath = Split-Path -Parent $existingLlama.Source
+          }
+          else {
+            Write-Host "Running: winget install llama.cpp"
+            $installResult = winget install llama.cpp --accept-source-agreements --accept-package-agreements 2>&1
+            Write-Host "WinGet output: $installResult"
+            
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "WinGet exit code: $LASTEXITCODE (may be normal if already installed)"
+            }
+            
+            Start-Sleep 5
+            
+            $llamaCmd = Get-Command llama -ErrorAction SilentlyContinue
+            if (-not $llamaCmd) {
+              Write-Host "Searching for llama.cpp installation..."
+              
+              $searchPaths = @(
+                "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
+                "$env:PROGRAMFILES\llama.cpp",
+                "$env:LOCALAPPDATA\Programs\llama.cpp",
+                "C:\Program Files\llama.cpp",
+                "C:\Program Files (x86)\llama.cpp"
+              )
+              
+              $llamaPath = $null
+              foreach ($searchPath in $searchPaths) {
+                if (Test-Path $searchPath) {
+                  $found = Get-ChildItem -Path $searchPath -Filter "llama*.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -match "^llama" } |
+                    Select-Object -First 1
+                  
+                  if ($found) {
+                    $llamaPath = $found.Directory.FullName
+                    Write-Host "Found llama.cpp at: $llamaPath"
+                    break
+                  }
+                }
+              }
+              
+              if ($llamaPath) {
+                $env:Path = "$llamaPath;$env:Path"
+              }
+              else {
+                throw "Could not locate llama.cpp installation"
+              }
+            }
+            else {
+              $llamaPath = Split-Path -Parent $llamaCmd.Source
+            }
+          }
+
+          "LLAMA_DIR=${llamaPath}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "✓ llama.cpp installation directory: $llamaPath"
+          
+          Write-Host "Available executables:"
+          Get-ChildItem -Path $llamaPath -Filter "*.exe" -ErrorAction SilentlyContinue | 
+            ForEach-Object { Write-Host "  - $($_.Name)" }
+
+          $rpcServerExe = Get-ChildItem -Path $llamaPath -Filter "*rpc-server*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          
+          if ($rpcServerExe) {
+            Write-Host "✓ Found dedicated RPC server: $($rpcServerExe.Name)"
+            "RPC_EXE=$($rpcServerExe.FullName)" | Out-File `
+              $env:GITHUB_ENV `
+              -Append `
+              -Encoding UTF8
+            "USE_RPC_SERVER=true" | Out-File `
+              $env:GITHUB_ENV `
+              -Append `
+              -Encoding UTF8
+          }
+          else {
+            Write-Host "Using llama-server with --rpc-server flag"
+            $llamaServerExe = Get-ChildItem -Path $llamaPath -Filter "llama-server.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $llamaServerExe) {
+              throw "llama-server.exe not found"
+            }
+            "RPC_EXE=$($llamaServerExe.FullName)" | Out-File `
+              $env:GITHUB_ENV `
+              -Append `
+              -Encoding UTF8
+            "USE_RPC_SERVER=false" | Out-File `
+              $env:GITHUB_ENV `
+              -Append `
+              -Encoding UTF8
+          }
+
+          Write-Host ""
+          Write-Host "Testing llama.cpp installation..."
+          try {
+            $versionOutput = & llama --version 2>&1
+            Write-Host "Version: $versionOutput"
+          }
+          catch {
+            Write-Host "Version check failed, continuing..."
+          }
+
+      # ────────────────────────────────────────────────────────
+      # START RPC SERVER
+      # ────────────────────────────────────────────────────────
+      - name: Start llama.cpp RPC Worker
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path $env:RPC_EXE)) {
+            throw "RPC executable missing: $env:RPC_EXE"
+          }
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $totalMB = [math]::Floor($os.TotalVisibleMemorySize / 1024)
+          $rpcMemory = [math]::Max(4096, $totalMB - 2048)
+          
+          $threads = [int]$env:NUMBER_OF_PROCESSORS
+          if ($threads -lt 1) { $threads = 2 }
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " STARTING DISTRIBUTED RPC WORKER"
+          Write-Host "=============================================="
+          Write-Host "RPC executable: $env:RPC_EXE"
+          Write-Host "RPC host:       0.0.0.0"
+          Write-Host "RPC port:       $env:RPC_PORT"
+          Write-Host "RPC memory:     $rpcMemory MB"
+          Write-Host "CPU threads:    $threads"
+          Write-Host "=============================================="
+          Write-Host ""
+
+          $useRpcServer = [bool]::Parse($env:USE_RPC_SERVER)
+          
+          if ($useRpcServer) {
+            Write-Host "Using dedicated RPC server..."
+            $arguments = @(
+              "--host", "0.0.0.0",
+              "--port", "$env:RPC_PORT",
+              "--mem", "$rpcMemory",
+              "--threads", "$threads",
+              "--cache"
+            )
+          }
+          else {
+            Write-Host "Using llama-server as RPC worker..."
+            $arguments = @(
+              "--rpc-server",
+              "--host", "0.0.0.0",
+              "--port", "$env:RPC_PORT",
+              "--mem", "$rpcMemory",
+              "--threads", "$threads"
+            )
+          }
+
+          Write-Host "Command: $env:RPC_EXE $($arguments -join ' ')"
+          Write-Host ""
+
+          $rpcLogFile = "$env:RUNNER_TEMP\rpc-server.log"
+          $rpcErrorFile = "$env:RUNNER_TEMP\rpc-server-error.log"
+          
+          $process = Start-Process `
+            -FilePath $env:RPC_EXE `
+            -ArgumentList $arguments `
+            -WorkingDirectory $env:LLAMA_DIR `
+            -RedirectStandardOutput $rpcLogFile `
+            -RedirectStandardError $rpcErrorFile `
+            -WindowStyle Hidden `
+            -PassThru
+
+          Write-Host "RPC server started with PID: $($process.Id)"
+          
+          "RPC_PID=$($process.Id)" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "Waiting for RPC server to initialize..."
+          Start-Sleep 10
+
+          if ($process.HasExited) {
+            Write-Host ""
+            Write-Host "RPC server exited with code: $($process.ExitCode)"
+            Write-Host ""
+            
+            if (Test-Path $rpcLogFile) {
+              Write-Host "===== RPC SERVER OUTPUT ====="
+              Get-Content $rpcLogFile -ErrorAction SilentlyContinue
+              Write-Host ""
+            }
+            
+            if (Test-Path $rpcErrorFile) {
+              Write-Host "===== RPC SERVER ERROR ====="
+              Get-Content $rpcErrorFile -ErrorAction SilentlyContinue
+              Write-Host ""
+            }
+            
+            if ($process.ExitCode -eq 0) {
+              Write-Host "RPC server exited cleanly (exit code 0)"
+              Write-Host "Checking if port is listening..."
+              
+              Start-Sleep 5
+              
+              $portCheck = netstat -an | Select-String ":$env:RPC_PORT"
+              if ($portCheck) {
+                Write-Host "✓ Port $env:RPC_PORT is listening!"
+                Write-Host $portCheck
+              }
+              else {
+                Write-Host "Port $env:RPC_PORT is not listening, restarting..."
+                
+                $process2 = Start-Process `
+                  -FilePath $env:RPC_EXE `
+                  -ArgumentList $arguments `
+                  -WorkingDirectory $env:LLAMA_DIR `
+                  -WindowStyle Normal `
+                  -PassThru
+                
+                "RPC_PID=$($process2.Id)" | Out-File `
+                  $env:GITHUB_ENV `
+                  -Append `
+                  -Encoding UTF8
+                
+                Start-Sleep 10
+                
+                if ($process2.HasExited) {
+                  Write-Host "Second attempt exited with code: $($process2.ExitCode)"
+                  Write-Host "Continuing - will verify port connectivity"
+                }
+                else {
+                  Write-Host "✓ Second attempt: RPC server running with PID: $($process2.Id)"
+                }
+              }
+            }
+            else {
+              throw "RPC server exited with error code: $($process.ExitCode)"
+            }
+          }
+          else {
+            Write-Host "✓ RPC server is running with PID: $($process.Id)"
+          }
+
+      # ────────────────────────────────────────────────────────
+      # VERIFY RPC CONNECTIVITY
+      # ────────────────────────────────────────────────────────
+      - name: Verify RPC Worker Connectivity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          
+          Write-Host "Verifying RPC worker connectivity..."
+          Write-Host "Target: $env:RPC_TAILSCALE_IP`:$env:RPC_PORT"
+          
+          Write-Host ""
+          Write-Host "Checking local port status:"
+          $localPortCheck = netstat -an | Select-String ":$env:RPC_PORT"
+          if ($localPortCheck) {
+            Write-Host "✓ Local port $env:RPC_PORT is listening:"
+            Write-Host $localPortCheck
+          }
+          else {
+            Write-Host "Local port $env:RPC_PORT might not be listening"
+            Write-Host "Checking all listening ports:"
+            netstat -an | Select-String "LISTENING" | Select-Object -First 10
+          }
+          
+          Write-Host ""
+          Write-Host "Testing connectivity via Tailscale IP..."
+          $ok = $false
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $test = Test-NetConnection `
+                -ComputerName $env:RPC_TAILSCALE_IP `
+                -Port $env:RPC_PORT `
+                -WarningAction SilentlyContinue `
+                -InformationLevel Quiet `
+                -ErrorAction Stop
+
+              if ($test) {
+                $ok = $true
+                Write-Host "✓ Connection successful on attempt $i"
+                break
+              }
+            }
+            catch {
+              $errorMsg = $_.Exception.Message
+              Write-Host "Attempt ${i}: ${errorMsg}"
+            }
+            
+            Start-Sleep 2
+          }
+
+          if (-not $ok) {
+            Write-Host ""
+            Write-Host "RPC port not directly reachable via TCP test"
+            Write-Host "This might be normal for RPC servers"
+            Write-Host "Continuing - the main server will try to connect"
+            
+            Write-Host ""
+            Write-Host "Attempting alternative connectivity check..."
+            try {
+              $tcpClient = New-Object System.Net.Sockets.TcpClient
+              $connection = $tcpClient.BeginConnect($env:RPC_TAILSCALE_IP, $env:RPC_PORT, $null, $null)
+              $waitResult = $connection.AsyncWaitHandle.WaitOne(5000, $false)
+              
+              if ($waitResult -and $tcpClient.Connected) {
+                Write-Host "✓ Alternative check: RPC server is reachable"
+                $tcpClient.Close()
+              }
+              else {
+                Write-Host "Alternative check: Could not establish connection"
+                Write-Host "Will still proceed - main server handles reconnection"
+                $tcpClient.Close()
+              }
+            }
+            catch {
+              $errorMsg = $_.Exception.Message
+              Write-Host "Alternative check error: ${errorMsg}"
+              Write-Host "Proceeding anyway - main server will retry"
+            }
+          }
+          else {
+            Write-Host "✓ RPC server is reachable via TCP test"
+          }
+
+      # ────────────────────────────────────────────────────────
+      # CONNECTION INFORMATION DISPLAY
+      # ────────────────────────────────────────────────────────
+      - name: Worker Connection Information
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "╔════════════════════════════════════════════════════╗"
+          Write-Host "║          RPC WORKER / RDP #2                      ║"
+          Write-Host "╠════════════════════════════════════════════════════╣"
+          Write-Host "║ Host:     $env:RPC_TAILSCALE_IP"
+          Write-Host "║ RDP Port: $env:RDP_PORT"
+          Write-Host "║ Username: $env:RDP_USERNAME"
+          Write-Host "║ Password: $env:RDP_WORKER_PASS"
+          Write-Host "║"
+          Write-Host "║ RPC endpoint:"
+          Write-Host "║ $env:RPC_TAILSCALE_IP`:$env:RPC_PORT"
+          Write-Host "╚════════════════════════════════════════════════════╝"
+          Write-Host ""
+
+      # ────────────────────────────────────────────────────────
+      # SESSION KEEP-ALIVE
+      # ────────────────────────────────────────────────────────
+      - name: Keep RPC Worker Alive
+        shell: pwsh
+        run: |
+          $timeout = [int]"${{ github.event.inputs.session_timeout_minutes }}"
+          $end = (Get-Date).AddMinutes($timeout + 2)
+
+          Write-Host "RPC worker will remain active until: $end"
+          Write-Host ""
+
+          while ((Get-Date) -lt $end) {
+            $remaining = $end - (Get-Date)
+            
+            $rpcRunning = $false
+            try {
+              $rpc = Get-Process -Id $env:RPC_PID -ErrorAction SilentlyContinue
+              if ($rpc -and !$rpc.HasExited) {
+                $rpcRunning = $true
+              }
+            }
+            catch {}
+            
+            if (-not $rpcRunning) {
+              Write-Host "RPC server process (PID: $env:RPC_PID) is not running"
+              Write-Host "Checking if port is still active..."
+              
+              $portActive = netstat -an | Select-String ":$env:RPC_PORT.*LISTENING"
+              if ($portActive) {
+                Write-Host "✓ Port $env:RPC_PORT is still listening"
+              }
+              else {
+                Write-Host "Port $env:RPC_PORT is no longer listening"
+              }
+            }
+
+            $freeMem = [math]::Round(
+              (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1
+            )
+
+            Write-Host ("[{0}] RPC worker active | Free RAM: {1:N1} GB | Remaining: {2:hh\:mm\:ss}" -f `
+              (Get-Date -Format "HH:mm:ss"), $freeMem, $remaining)
+
+            Start-Sleep 60
+          }
+
+          Write-Host ""
+          Write-Host "RPC worker session timeout reached."
+
+      # ────────────────────────────────────────────────────────
+      # CLEANUP
+      # ────────────────────────────────────────────────────────
+      - name: RPC Worker Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Cleaning up RPC worker..."
+
+          try {
+            if ($env:RPC_PID) {
+              Stop-Process -Id $env:RPC_PID -Force -ErrorAction SilentlyContinue
+              Write-Host "✓ RPC server process stopped"
+            }
+          }
+          catch {
+            Write-Host "Process cleanup: $_"
+          }
+
+          try {
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+            Write-Host "✓ Tailscale disconnected"
+          }
+          catch {
+            Write-Host "Tailscale cleanup: $_"
+          }
+
+          try {
+            netsh advfirewall firewall delete rule name="$env:RPC_FIREWALL_RULE" 2>$null
+            netsh advfirewall firewall delete rule name="$env:RDP_FIREWALL_RULE" 2>$null
+            Write-Host "✓ Firewall rules removed"
+          }
+          catch {
+            Write-Host "Firewall cleanup: $_"
+          }
+
+          Write-Host "✓ RPC worker cleanup complete"
+
+  # ═══════════════════════════════════════════════════════════════
+  # MAIN LLAMA SERVER
+  # This is the FIRST RDP machine.
+  # ═══════════════════════════════════════════════════════════════
+
+  llama-host:
+    runs-on: windows-latest
+    timeout-minutes: 370
+
+    env:
+      RDP_USERNAME: 'RDP'
+      RDP_PORT: '3389'
+      LLAMA_PORT: '8080'
+      RPC_PORT: '50052'
+      TAILSCALE_HOSTNAME: 'llama-main-${{ github.run_id }}'
+      RPC_HOSTNAME: 'llama-rpc-${{ github.run_id }}'
+      RDP_FIREWALL_RULE: 'RDP-Tailscale'
+      LLAMA_FIREWALL_RULE: 'llama.cpp-API-Tailscale'
+      REMOTE_DESKTOP_SERVICE: 'TermService'
+
+    steps:
+      # ────────────────────────────────────────────────────────
+      # SYSTEM INFORMATION
+      # ────────────────────────────────────────────────────────
+      - name: Show Main Hardware
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " MAIN LLAMA HOST HARDWARE"
+          Write-Host "=============================================="
+          
+          Get-CimInstance Win32_ComputerSystem | 
+            Select-Object NumberOfLogicalProcessors, TotalPhysicalMemory | 
+            Format-List
+          
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host ("RAM: {0:N2} GB" -f ($os.TotalVisibleMemorySize / 1MB))
+          Write-Host "CPU threads: $env:NUMBER_OF_PROCESSORS"
+          Write-Host ""
+
+      # ────────────────────────────────────────────────────────
+      # INPUT VALIDATION
+      # ────────────────────────────────────────────────────────
+      - name: Validate Configuration
+        shell: pwsh
+        run: |
+          $context = [int]"${{ github.event.inputs.context }}"
+          if ($context -lt 4096 -or $context -gt 131072) {
+            throw "Context must be between 4096 and 131072. Got: $context"
+          }
+
+          $timeout = [int]"${{ github.event.inputs.session_timeout_minutes }}"
+          if ($timeout -lt 5 -or $timeout -gt 360) {
+            throw "Timeout must be between 5 and 360 minutes. Got: $timeout"
+          }
+
+          $model = "${{ github.event.inputs.model }}"
+          if ([string]::IsNullOrWhiteSpace($model)) {
+            $model = "mradermacher/Qwen3.5-27B-Uncensored-GGUF:Q4_K_M"
+          }
+
+          "LLAMA_MODEL=${model}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          "LLAMA_CONTEXT=${context}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "Configuration validated:"
+          Write-Host "  Model:   $model"
+          Write-Host "  Context: $context"
+          Write-Host "  Timeout: $timeout minutes"
+          Write-Host ""
+
+      # ────────────────────────────────────────────────────────
+      # RDP CONFIGURATION
+      # ────────────────────────────────────────────────────────
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Restart-Service `
+            -Name $env:REMOTE_DESKTOP_SERVICE `
+            -Force
+
+          Write-Host "✓ RDP enabled"
+
+      # ────────────────────────────────────────────────────────
+      # RDP USER CREATION
+      # ────────────────────────────────────────────────────────
+      - name: Create RDP User
+        shell: pwsh
+        run: |
+          $upper   = [char[]](65..90)
+          $lower   = [char[]](97..122)
+          $numbers = [char[]](48..57)
+          $special = @('!', '@', '#', '$', '%', '^', '&', '*')
+          
+          $chars = @()
+          $chars += ($upper   | Get-Random -Count 4)
+          $chars += ($lower   | Get-Random -Count 4)
+          $chars += ($numbers | Get-Random -Count 4)
+          $chars += ($special | Get-Random -Count 4)
+          
+          $password = -join ($chars | Get-Random -Count 16)
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          $existing = Get-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          if ($existing) {
+            Set-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword
+          }
+          else {
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -AccountNeverExpires | Out-Null
+
+            Add-LocalGroupMember `
+              -Group "Administrators" `
+              -Member $env:RDP_USERNAME
+
+            Add-LocalGroupMember `
+              -Group "Remote Desktop Users" `
+              -Member $env:RDP_USERNAME
+          }
+
+          "RDP_MAIN_PASS=${password}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "✓ Main RDP user ready"
+
+      # ────────────────────────────────────────────────────────
+      # TAILSCALE INSTALLATION
+      # ────────────────────────────────────────────────────────
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $installer = "$env:TEMP\tailscale.msi"
+          $ProgressPreference = "SilentlyContinue"
+          
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          $p = Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($p.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code: $($p.ExitCode)"
+          }
+
+          Start-Sleep 5
+          Write-Host "✓ Tailscale installed"
+
+      - name: Connect Tailscale Main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          & $tailscale up `
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --hostname="$env:TAILSCALE_HOSTNAME" `
+            --accept-dns=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed"
+          }
+
+          $ip = $null
+          for ($i = 1; $i -le 30; $i++) {
+            $ip = (& $tailscale ip -4 2>$null).Trim()
+            if ($ip) { break }
+            Start-Sleep 2
+          }
+
+          if (-not $ip) {
+            throw "No Tailscale IPv4 address obtained"
+          }
+
+          "MAIN_TAILSCALE_IP=${ip}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "✓ Main Tailscale IP: $ip"
+
+      # ────────────────────────────────────────────────────────
+      # FIREWALL CONFIGURATION
+      # ────────────────────────────────────────────────────────
+      - name: Configure Tailscale Firewall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          netsh advfirewall firewall delete rule name="$env:RDP_FIREWALL_RULE" 2>$null
+          netsh advfirewall firewall delete rule name="$env:LLAMA_FIREWALL_RULE" 2>$null
+
+          netsh advfirewall firewall add rule `
+            name="$env:RDP_FIREWALL_RULE" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=$env:RDP_PORT `
+            remoteip=100.64.0.0/10 `
+            profile=any
+
+          netsh advfirewall firewall add rule `
+            name="$env:LLAMA_FIREWALL_RULE" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=$env:LLAMA_PORT `
+            remoteip=100.64.0.0/10 `
+            profile=any
+
+          Write-Host "✓ RDP restricted to Tailscale (100.64.0.0/10)"
+          Write-Host "✓ llama.cpp API restricted to Tailscale (100.64.0.0/10)"
+
+      # ────────────────────────────────────────────────────────
+      # LLAMA.CPP INSTALLATION VIA WINGET
+      # ────────────────────────────────────────────────────────
+      - name: Install llama.cpp via WinGet
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Installing llama.cpp via WinGet..."
+          
+          $existingLlama = Get-Command llama -ErrorAction SilentlyContinue
+          if ($existingLlama) {
+            Write-Host "llama.cpp is already installed at: $($existingLlama.Source)"
+            $llamaPath = Split-Path -Parent $existingLlama.Source
+          }
+          else {
+            Write-Host "Running: winget install llama.cpp"
+            $installResult = winget install llama.cpp --accept-source-agreements --accept-package-agreements 2>&1
+            Write-Host "WinGet output: $installResult"
+            
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "WinGet exit code: $LASTEXITCODE (may be normal if already installed)"
+            }
+            
+            Start-Sleep 5
+            
+            $llamaCmd = Get-Command llama -ErrorAction SilentlyContinue
+            if (-not $llamaCmd) {
+              Write-Host "Searching for llama.cpp installation..."
+              
+              $searchPaths = @(
+                "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
+                "$env:PROGRAMFILES\llama.cpp",
+                "$env:LOCALAPPDATA\Programs\llama.cpp",
+                "C:\Program Files\llama.cpp",
+                "C:\Program Files (x86)\llama.cpp"
+              )
+              
+              $llamaPath = $null
+              foreach ($searchPath in $searchPaths) {
+                if (Test-Path $searchPath) {
+                  $found = Get-ChildItem -Path $searchPath -Filter "llama*.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Name -match "^llama" } |
+                    Select-Object -First 1
+                  
+                  if ($found) {
+                    $llamaPath = $found.Directory.FullName
+                    Write-Host "Found llama.cpp at: $llamaPath"
+                    break
+                  }
+                }
+              }
+              
+              if ($llamaPath) {
+                $env:Path = "$llamaPath;$env:Path"
+              }
+              else {
+                throw "Could not locate llama.cpp installation"
+              }
+            }
+            else {
+              $llamaPath = Split-Path -Parent $llamaCmd.Source
+            }
+          }
+
+          "LLAMA_DIR=${llamaPath}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          "LLAMA_EXE=${llamaPath}\llama-server.exe" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "✓ llama.cpp installation directory: $llamaPath"
+          
+          Write-Host "Available executables:"
+          Get-ChildItem -Path $llamaPath -Filter "*.exe" -ErrorAction SilentlyContinue | 
+            ForEach-Object { Write-Host "  - $($_.Name)" }
+
+          Write-Host ""
+          Write-Host "Testing llama.cpp installation..."
+          try {
+            $versionOutput = & llama --version 2>&1
+            Write-Host "Version: $versionOutput"
+          }
+          catch {
+            Write-Host "Version check failed, continuing..."
+          }
+
+      # ────────────────────────────────────────────────────────
+      # DISCOVER RPC WORKER
+      # ────────────────────────────────────────────────────────
+      - name: Discover RPC Worker
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host ""
+          Write-Host "Searching for RPC worker: $env:RPC_HOSTNAME"
+
+          $rpcIP = $null
+
+          for ($i = 1; $i -le 60; $i++) {
+            try {
+              $result = Resolve-DnsName `
+                -Name $env:RPC_HOSTNAME `
+                -Type A `
+                -ErrorAction Stop
+
+              $rpcIP = $result | 
+                Where-Object { $_.IPAddress } | 
+                Select-Object -First 1 -ExpandProperty IPAddress
+
+              if ($rpcIP) { break }
+            }
+            catch {}
+
+            if ($i % 10 -eq 0) {
+              Write-Host "Waiting for RPC worker DNS... (${i}/60)"
+            }
+            Start-Sleep 5
+          }
+
+          if (-not $rpcIP) {
+            Write-Host ""
+            Write-Host "DNS resolution failed. Attempting Tailscale status check..."
+            
+            $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            & $tailscale status
+            
+            throw "Could not discover RPC worker at $env:RPC_HOSTNAME"
+          }
+
+          "RPC_IP=${rpcIP}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "✓ RPC worker discovered at: $rpcIP"
+
+      # ────────────────────────────────────────────────────────
+      # WAIT FOR RPC WORKER
+      # ────────────────────────────────────────────────────────
+      - name: Wait For RPC Worker
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          
+          Write-Host ""
+          Write-Host "Waiting for RPC worker at $env:RPC_IP`:$env:RPC_PORT"
+          
+          $ok = $false
+
+          for ($i = 1; $i -le 60; $i++) {
+            try {
+              $test = Test-NetConnection `
+                -ComputerName $env:RPC_IP `
+                -Port $env:RPC_PORT `
+                -WarningAction SilentlyContinue `
+                -InformationLevel Quiet `
+                -ErrorAction Stop
+
+              if ($test) {
+                $ok = $true
+                Write-Host "✓ Connection successful on attempt $i"
+                break
+              }
+            }
+            catch {
+              $errorMsg = $_.Exception.Message
+              Write-Host "Attempt ${i}: ${errorMsg}"
+            }
+
+            if ($i % 10 -eq 0) {
+              Write-Host "Waiting for RPC worker... (${i}/60)"
+            }
+            Start-Sleep 5
+          }
+
+          if (-not $ok) {
+            Write-Host ""
+            Write-Host "RPC worker TCP test failed - this may be normal"
+            Write-Host "Proceeding with server startup - RPC library handles reconnection"
+          }
+          else {
+            Write-Host "✓ RPC worker reachable at $env:RPC_IP`:$env:RPC_PORT"
+          }
+
+      # ────────────────────────────────────────────────────────
+      # START DISTRIBUTED LLAMA SERVER
+      # ────────────────────────────────────────────────────────
+      - name: Start Distributed llama.cpp Server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $threads = [int]$env:NUMBER_OF_PROCESSORS
+          if ($threads -lt 1) { $threads = 2 }
+
+          Write-Host ""
+          Write-Host "================================================"
+          Write-Host " DISTRIBUTED LLAMA.CPP CONFIGURATION"
+          Write-Host "================================================"
+          Write-Host "Model:         $env:LLAMA_MODEL"
+          Write-Host "Context:       $env:LLAMA_CONTEXT"
+          Write-Host "RPC worker:    $env:RPC_IP`:$env:RPC_PORT"
+          Write-Host "Threads:       $threads"
+          Write-Host "Tensor split:  1,1 (equal distribution)"
+          Write-Host "KV Cache K:    q8_0"
+          Write-Host "KV Cache V:    q8_0"
+          Write-Host "Flash Attn:    ON"
+          Write-Host "API port:      $env:LLAMA_PORT"
+          Write-Host "================================================"
+          Write-Host ""
+
+          $arguments = @(
+            "serve",
+            "-hf", "$env:LLAMA_MODEL",
+            "--host", "0.0.0.0",
+            "--port", "$env:LLAMA_PORT",
+            "--ctx-size", "$env:LLAMA_CONTEXT",
+            "--n-gpu-layers", "999",
+            "--rpc", "$env:RPC_IP`:$env:RPC_PORT",
+            "--tensor-split", "1,1",
+            "--threads", "$threads",
+            "--threads-batch", "$threads",
+            "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0",
+            "--flash-attn",
+            "--parallel", "1",
+            "--batch-size", "512",
+            "--ubatch-size", "256",
+            "--no-warmup"
+          )
+
+          Write-Host "Launching command:"
+          Write-Host "llama $($arguments -join ' ')"
+          Write-Host ""
+
+          $logFile = "$env:RUNNER_TEMP\llama-server.log"
+          $errorFile = "$env:RUNNER_TEMP\llama-server-error.log"
+
+          $process = Start-Process `
+            -FilePath "llama" `
+            -ArgumentList $arguments `
+            -WorkingDirectory $env:LLAMA_DIR `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError $errorFile `
+            -WindowStyle Hidden `
+            -PassThru
+
+          "LLAMA_PID=$($process.Id)" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "llama.cpp server started with PID: $($process.Id)"
+          Write-Host "Waiting for API to become ready (this may take several minutes for model download)..."
+
+          $ready = $false
+          $startTime = Get-Date
+          $timeoutSeconds = 600
+
+          for ($i = 1; $i -le 300; $i++) {
+            $elapsed = (Get-Date) - $startTime
+            
+            if ($process.HasExited) {
+              Write-Host ""
+              Write-Host "llama-server exited unexpectedly (code: $($process.ExitCode))"
+              Write-Host ""
+              
+              if (Test-Path $errorFile) {
+                Write-Host "===== STDERR ====="
+                Get-Content $errorFile -ErrorAction SilentlyContinue | Select-Object -Last 50
+                Write-Host ""
+              }
+              
+              if (Test-Path $logFile) {
+                Write-Host "===== STDOUT ====="
+                Get-Content $logFile -ErrorAction SilentlyContinue | Select-Object -Last 50
+                Write-Host ""
+              }
+              
+              throw "llama-server exited during startup with code: $($process.ExitCode)"
+            }
+
+            try {
+              $response = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:$env:LLAMA_PORT/health" `
+                -UseBasicParsing `
+                -TimeoutSec 5 `
+                -ErrorAction Stop
+
+              if ($response.StatusCode -eq 200) {
+                $ready = $true
+                Write-Host ""
+                Write-Host "✓ API health check passed after $($elapsed.TotalSeconds) seconds"
+                break
+              }
+            }
+            catch {
+              if ($i % 15 -eq 0) {
+                Write-Host "[$($elapsed.ToString('mm\:ss'))] Waiting for API... (attempt $i)"
+                
+                if (Test-Path $logFile) {
+                  $recentLogs = Get-Content $logFile -Tail 2 -ErrorAction SilentlyContinue
+                  if ($recentLogs) {
+                    Write-Host "  Recent: $($recentLogs -join ' | ')"
+                  }
+                }
+              }
+            }
+            
+            Start-Sleep 2
+            
+            if ($elapsed.TotalSeconds -gt $timeoutSeconds) {
+              break
+            }
+          }
+
+          if (-not $ready) {
+            Write-Host ""
+            Write-Host "===== LLAMA SERVER LOGS ====="
+            if (Test-Path $logFile) {
+              Write-Host "STDOUT (last 100 lines):"
+              Get-Content $logFile -Tail 100 -ErrorAction SilentlyContinue
+            }
+            
+            if (Test-Path $errorFile) {
+              Write-Host ""
+              Write-Host "STDERR (last 100 lines):"
+              Get-Content $errorFile -Tail 100 -ErrorAction SilentlyContinue
+            }
+            
+            throw "llama.cpp API did not become ready within the timeout period."
+          }
+
+          Write-Host ""
+          Write-Host "✓ DISTRIBUTED LLAMA.CPP IS READY"
+          Write-Host "✓ API endpoint: http://127.0.0.1:$env:LLAMA_PORT"
+          Write-Host ""
+
+      # ────────────────────────────────────────────────────────
+      # TEST API FUNCTIONALITY
+      # ────────────────────────────────────────────────────────
+      - name: Test llama.cpp API
+        shell: pwsh
+        run: |
+          Write-Host "Testing OpenAI-compatible chat completions endpoint..."
+
+          $body = @{
+            model    = $env:LLAMA_MODEL
+            messages = @(
+              @{
+                role    = "user"
+                content = "Reply with exactly: distributed llama cpp online"
+              }
+            )
+            max_tokens  = 20
+            temperature = 0.1
+          } | ConvertTo-Json -Depth 10
+
+          try {
+            $response = Invoke-RestMethod `
+              -Uri "http://127.0.0.1:$env:LLAMA_PORT/v1/chat/completions" `
+              -Method Post `
+              -ContentType "application/json" `
+              -Body $body `
+              -TimeoutSec 300
+
+            Write-Host ""
+            Write-Host "MODEL RESPONSE:"
+            Write-Host $response.choices[0].message.content
+            Write-Host ""
+            Write-Host "✓ API TEST PASSED"
+          }
+          catch {
+            Write-Host ""
+            Write-Host "===== SERVER ERROR ====="
+            if (Test-Path "$env:RUNNER_TEMP\llama-server-error.log") {
+              Get-Content "$env:RUNNER_TEMP\llama-server-error.log" -Tail 20 -ErrorAction SilentlyContinue
+            }
+            throw "API test failed: $_"
+          }
+
+      # ────────────────────────────────────────────────────────
+      # NGROK TUNNEL (OPTIONAL)
+      # ────────────────────────────────────────────────────────
+      - name: Setup ngrok Tunnel (Optional)
+        if: ${{ github.event.inputs.ngrok_auth_token != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          Write-Host "Setting up ngrok tunnel for public API access..."
+          
+          Invoke-WebRequest `
+            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile "$env:TEMP\ngrok.zip"
+
+          Expand-Archive `
+            -Path "$env:TEMP\ngrok.zip" `
+            -DestinationPath "$env:RUNNER_TEMP\ngrok" `
+            -Force
+
+          $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
+          
+          & $ngrok config add-authtoken "${{ github.event.inputs.ngrok_auth_token }}"
+          
+          $ngrokProcess = Start-Process `
+            -FilePath $ngrok `
+            -ArgumentList "http", "$env:LLAMA_PORT", "--log=stdout" `
+            -WindowStyle Hidden `
+            -PassThru `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\ngrok.log"
+
+          "NGROK_PID=$($ngrokProcess.Id)" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Start-Sleep 5
+          
+          $ngrokUrl = Invoke-RestMethod `
+            -Uri "http://127.0.0.1:4040/api/tunnels" `
+            -TimeoutSec 5 | 
+            Select-Object -ExpandProperty tunnels | 
+            Where-Object { $_.proto -eq "https" } | 
+            Select-Object -ExpandProperty public_url
+
+          "NGROK_URL=${ngrokUrl}" | Out-File `
+            $env:GITHUB_ENV `
+            -Append `
+            -Encoding UTF8
+
+          Write-Host "✓ ngrok tunnel active"
+          Write-Host "✓ Public URL: $ngrokUrl"
+
+      # ────────────────────────────────────────────────────────
+      # CONNECTION INFORMATION DISPLAY
+      # ────────────────────────────────────────────────────────
+      - name: Display Connection Information
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════╗"
+          Write-Host "║       DISTRIBUTED LLAMA.CPP RDP SESSION                 ║"
+          Write-Host "╠══════════════════════════════════════════════════════════╣"
+          Write-Host "║"
+          Write-Host "║ ─── RDP #1 (MAIN) ───"
+          Write-Host "║ Host:     $env:MAIN_TAILSCALE_IP"
+          Write-Host "║ Port:     $env:RDP_PORT"
+          Write-Host "║ Username: $env:RDP_USERNAME"
+          Write-Host "║ Password: $env:RDP_MAIN_PASS"
+          Write-Host "║"
+          Write-Host "║ ─── RDP #2 (RPC WORKER) ───"
+          Write-Host "║ Hostname: $env:RPC_HOSTNAME"
+          Write-Host "║ Port:     $env:RDP_PORT"
+          Write-Host "║"
+          Write-Host "║ ─── LLAMA.CPP API ───"
+          Write-Host "║ Local:  http://127.0.0.1:$env:LLAMA_PORT"
+          Write-Host "║ Remote: http://$env:MAIN_TAILSCALE_IP`:$env:LLAMA_PORT"
+          Write-Host "║ OpenAI: http://$env:MAIN_TAILSCALE_IP`:$env:LLAMA_PORT/v1"
+
+          if ($env:NGROK_URL) {
+            Write-Host "║"
+            Write-Host "║ ─── PUBLIC (ngrok) ───"
+            Write-Host "║ URL: $env:NGROK_URL"
+            Write-Host "║ OpenAI: $env:NGROK_URL/v1"
+          }
+
+          Write-Host "║"
+          Write-Host "║ ─── CONFIGURATION ───"
+          Write-Host "║ Model:    $env:LLAMA_MODEL"
+          Write-Host "║ Context:  $env:LLAMA_CONTEXT"
+          Write-Host "║ RPC:      $env:RPC_IP`:$env:RPC_PORT"
+          Write-Host "║ Split:    1:1 (equal distribution)"
+          Write-Host "║ KV K:     Q8_0"
+          Write-Host "║ KV V:     Q8_0"
+          Write-Host "║ Flash:    ON"
+          Write-Host "╚══════════════════════════════════════════════════════════╝"
+          Write-Host ""
+          Write-Host "IMPORTANT:"
+          Write-Host "• RDP #1 is the main llama.cpp host with API endpoints"
+          Write-Host "• RDP #2 is the remote RPC compute/RAM worker"
+          Write-Host "• The two machines distribute ONE model across both"
+          Write-Host "• NOT running two separate model instances"
+          Write-Host "• Using 'llama serve' command for server functionality"
+          Write-Host ""
+
+      # ────────────────────────────────────────────────────────
+      # SESSION KEEP-ALIVE
+      # ────────────────────────────────────────────────────────
+      - name: Keep Main Session Alive
+        shell: pwsh
+        run: |
+          $timeout = [int]"${{ github.event.inputs.session_timeout_minutes }}"
+          $end = (Get-Date).AddMinutes($timeout + 2)
+
+          Write-Host "Session will remain active until: $end"
+          Write-Host ""
+
+          $lastStatusTime = Get-Date
+
+          while ((Get-Date) -lt $end) {
+            $remaining = $end - (Get-Date)
+
+            $llama = Get-Process `
+              -Id $env:LLAMA_PID `
+              -ErrorAction SilentlyContinue
+
+            if (-not $llama) {
+              Write-Host "WARNING: llama-server process has stopped."
+              
+              if (Test-Path "$env:RUNNER_TEMP\llama-server-error.log") {
+                Write-Host ""
+                Write-Host "Last error log entries:"
+                Get-Content "$env:RUNNER_TEMP\llama-server-error.log" -Tail 20
+                Write-Host ""
+              }
+            }
+
+            if (((Get-Date) - $lastStatusTime).TotalMinutes -ge 5) {
+              Write-Host ""
+              Write-Host "─── Status Update ───"
+              
+              $os = Get-CimInstance Win32_OperatingSystem
+              Write-Host ("Free RAM: {0:N1} GB / {1:N1} GB" -f `
+                ($os.FreePhysicalMemory / 1MB), ($os.TotalVisibleMemorySize / 1MB))
+
+              if ($llama) {
+                Write-Host ("llama.cpp CPU: {0:N1}s | RAM: {1:N1} MB" -f `
+                  $llama.CPU, ($llama.WorkingSet64 / 1MB))
+              }
+
+              Write-Host "────────────────────"
+              Write-Host ""
+
+              $lastStatusTime = Get-Date
+            }
+
+            Write-Host ("[{0}] Active | Remaining: {1:hh\:mm\:ss}" -f `
+              (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $remaining)
+
+            Start-Sleep 60
+          }
+
+          Write-Host ""
+          Write-Host "Session timeout reached."
+
+      # ────────────────────────────────────────────────────────
+      # LOGS DISPLAY
+      # ────────────────────────────────────────────────────────
+      - name: Show llama.cpp Logs
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " LLAMA.CPP LOGS"
+          Write-Host "=============================================="
+
+          if (Test-Path "$env:RUNNER_TEMP\llama-server-error.log") {
+            Write-Host ""
+            Write-Host "─── Error Log (last 100 lines) ───"
+            Get-Content "$env:RUNNER_TEMP\llama-server-error.log" -Tail 100
+          }
+
+          if (Test-Path "$env:RUNNER_TEMP\llama-server.log") {
+            Write-Host ""
+            Write-Host "─── Output Log (last 50 lines) ───"
+            Get-Content "$env:RUNNER_TEMP\llama-server.log" -Tail 50
+          }
+
+          if (Test-Path "$env:RUNNER_TEMP\ngrok.log") {
+            Write-Host ""
+            Write-Host "─── ngrok Log (last 20 lines) ───"
+            Get-Content "$env:RUNNER_TEMP\ngrok.log" -Tail 20
+          }
+
+          Write-Host ""
+          Write-Host "=============================================="
+
+      # ────────────────────────────────────────────────────────
+      # CLEANUP
+      # ────────────────────────────────────────────────────────
+      - name: Main Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "Cleaning up main host..."
+
+          try {
+            if ($env:LLAMA_PID) {
+              Stop-Process -Id $env:LLAMA_PID -Force -ErrorAction SilentlyContinue
+              Write-Host "✓ llama-server process stopped"
+            }
+          }
+          catch {
+            Write-Host "llama-server cleanup: $_"
+          }
+
+          try {
+            if ($env:NGROK_PID) {
+              Stop-Process -Id $env:NGROK_PID -Force -ErrorAction SilentlyContinue
+              Write-Host "✓ ngrok process stopped"
+            }
+          }
+          catch {
+            Write-Host "ngrok cleanup: $_"
+          }
+
+          try {
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+            Write-Host "✓ Tailscale disconnected"
+          }
+          catch {
+            Write-Host "Tailscale cleanup: $_"
+          }
+
+          try {
+            netsh advfirewall firewall delete rule name="$env:RDP_FIREWALL_RULE" 2>$null
+            netsh advfirewall firewall delete rule name="$env:LLAMA_FIREWALL_RULE" 2>$null
+            Write-Host "✓ Firewall rules removed"
+          }
+          catch {
+            Write-Host "Firewall cleanup: $_"
+          }
+
+          Write-Host "✓ Main cleanup complete"
+          Write-Host ""
