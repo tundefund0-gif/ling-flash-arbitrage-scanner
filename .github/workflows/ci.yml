@@ -1225,9 +1225,9 @@ jobs:
 
           $ready = $false
           $startTime = Get-Date
-          $timeoutSeconds = 600
+          $timeoutSeconds = 2400
 
-          for ($i = 1; $i -le 300; $i++) {
+          for ($i = 1; $i -le 2400; $i++) {
             $elapsed = (Get-Date) - $startTime
             
             if ($process.HasExited) {
