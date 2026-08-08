@@ -418,8 +418,7 @@ jobs:
             $arguments = @(
               "--host", "0.0.0.0",
               "--port", "$env:RPC_PORT",
-              "--threads", "$threads",
-              "--cache"
+              "--threads", "$threads"
             )
           }
           else {
@@ -631,32 +630,67 @@ jobs:
         run: |
           $timeout = [int]"${{ github.event.inputs.session_timeout_minutes }}"
           $end = (Get-Date).AddMinutes($timeout + 2)
+          $restarts = 0
+          $rpcPid = [int]$env:RPC_PID
 
           Write-Host "RPC worker will remain active until: $end"
           Write-Host ""
 
+          function Restart-RpcServer([int]$attempt) {
+            $rpcLogFile = "$env:RUNNER_TEMP\rpc-server-restart-$attempt.log"
+            $rpcErrorFile = "$env:RUNNER_TEMP\rpc-server-error-restart-$attempt.log"
+            $arguments = @(
+              "--host", "0.0.0.0",
+              "--port", "$env:RPC_PORT",
+              "--threads", ([int]$env:NUMBER_OF_PROCESSORS)
+            )
+            $proc = Start-Process `
+              -FilePath $env:RPC_EXE `
+              -ArgumentList $arguments `
+              -WorkingDirectory $env:LLAMA_DIR `
+              -RedirectStandardOutput $rpcLogFile `
+              -RedirectStandardError $rpcErrorFile `
+              -WindowStyle Hidden `
+              -PassThru
+            Start-Sleep 5
+            return $proc
+          }
+
           while ((Get-Date) -lt $end) {
             $remaining = $end - (Get-Date)
-            
+
             $rpcRunning = $false
             try {
-              $rpc = Get-Process -Id $env:RPC_PID -ErrorAction SilentlyContinue
+              $rpc = Get-Process -Id $rpcPid -ErrorAction SilentlyContinue
               if ($rpc -and !$rpc.HasExited) {
                 $rpcRunning = $true
               }
             }
             catch {}
-            
+
             if (-not $rpcRunning) {
-              Write-Host "RPC server process (PID: $env:RPC_PID) is not running"
-              Write-Host "Checking if port is still active..."
-              
+              Write-Host "RPC server process (PID: $rpcPid) is not running"
+
               $portActive = netstat -an | Select-String ":$env:RPC_PORT.*LISTENING"
               if ($portActive) {
                 Write-Host "✓ Port $env:RPC_PORT is still listening"
               }
               else {
-                Write-Host "Port $env:RPC_PORT is no longer listening"
+                Write-Host "Port $env:RPC_PORT is no longer listening - restarting worker..."
+                if ($restarts -lt 20) {
+                  $proc = Restart-RpcServer ($restarts + 1)
+                  $restarts++
+                  if ($proc.HasExited) {
+                    Write-Host "Restart attempt $restarts exited with code: $($proc.ExitCode)"
+                  }
+                  else {
+                    $rpcPid = $proc.Id
+                    Write-Host "✓ Restarted RPC server (PID: $($proc.Id), attempt $($restarts))"
+                  }
+                }
+                else {
+                  Write-Host "Maximum restarts reached (20)"
+                }
               }
             }
 
@@ -1096,7 +1130,52 @@ jobs:
           Write-Host "Target:      $modelPath"
 
           if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -lt 100000000) {
-            curl.exe -L --retry 5 --retry-all-errors -C - -o $modelPath $url
+            Write-Host "Single-connection download can be throttled; using segmented parallel download..."
+            $sizeBytes = [long]0
+            try {
+              $head = curl.exe -sIL $url
+              if ($head -match 'x-linked-size:\s*(\d+)') { $sizeBytes = [long]$Matches[1] }
+            } catch {}
+
+            if ($sizeBytes -gt 0) {
+              $segments = 16
+              $segSize = [long][math]::Floor($sizeBytes / $segments)
+              $jobs = @()
+              $tempDir = "$env:TEMP\gguf_parts"
+              New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+              for ($i = 0; $i -lt $segments; $i++) {
+                $start = $i * $segSize
+                $end = if ($i -eq $segments - 1) { $sizeBytes - 1 } else { ($i + 1) * $segSize - 1 }
+                $part = "$tempDir\part_$i"
+                $jobs += Start-Job -ArgumentList $url, $start, $end, $part, $i -ScriptBlock {
+                  param($u, $s, $e, $p, $idx)
+                  & curl.exe -L -sS --retry 10 --retry-all-errors -H "Range: bytes=$s-$e" -o $p $u
+                  return $LASTEXITCODE
+                }
+              }
+              Wait-Job $jobs -Timeout 1800 | Out-Null
+              $jobResults = @($jobs | ForEach-Object { Receive-Job -Job $_ -Keep })
+              $failed = @($jobResults | Where-Object { $_ -ne 0 })
+              if ($failed.Count -eq 0) {
+                Write-Host "All $segments segments downloaded, combining..."
+                $parts = Get-ChildItem "$tempDir\part_*" | Sort-Object Name
+                $fsOut = [System.IO.File]::Open($modelPath, [System.IO.FileMode]::Create)
+                foreach ($p in $parts) {
+                  $fsIn = [System.IO.File]::OpenRead($p.FullName)
+                  $fsIn.CopyTo($fsOut)
+                  $fsIn.Close()
+                }
+                $fsOut.Close()
+                Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+                $global:LASTEXITCODE = 0
+              } else {
+                Write-Host "$($failed.Count) segments failed, falling back to single-stream with resume"
+                curl.exe -L --retry 5 --retry-all-errors -C - -o $modelPath $url
+              }
+              Remove-Job $jobs -Force -ErrorAction SilentlyContinue
+            } else {
+              curl.exe -L --retry 5 --retry-all-errors -C - -o $modelPath $url
+            }
             if ($LASTEXITCODE -ne 0) {
               throw "Model download failed with exit code: $LASTEXITCODE"
             }
@@ -1222,41 +1301,51 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          
+
           Write-Host ""
           Write-Host "Waiting for RPC worker at $env:RPC_IP`:$env:RPC_PORT"
-          
+
           $ok = $false
 
-          for ($i = 1; $i -le 60; $i++) {
+          function Test-TcpPort([string]$ip, [int]$port, [int]$timeoutMs = 2000) {
             try {
-              $test = Test-NetConnection `
-                -ComputerName $env:RPC_IP `
-                -Port $env:RPC_PORT `
-                -WarningAction SilentlyContinue `
-                -InformationLevel Quiet `
-                -ErrorAction Stop
-
-              if ($test) {
-                $ok = $true
-                Write-Host "✓ Connection successful on attempt $i"
-                break
+              $client = New-Object System.Net.Sockets.TcpClient
+              $async = $client.BeginConnect($ip, $port, $null, $null)
+              if (-not $async.AsyncWaitHandle.WaitOne($timeoutMs)) {
+                $client.Close()
+                return $false
               }
+              if ($client.Connected) { $client.Close(); return $true }
+              $client.Close()
+              return $false
             }
-            catch {
-              $errorMsg = $_.Exception.Message
-              Write-Host "Attempt ${i}: ${errorMsg}"
-            }
+            catch { return $false }
+          }
 
-            if ($i % 10 -eq 0) {
-              Write-Host "Waiting for RPC worker... (${i}/60)"
+          for ($i = 1; $i -le 20; $i++) {
+            if (Test-TcpPort $env:RPC_IP ([int]$env:RPC_PORT)) {
+              $ok = $true
+              Write-Host "✓ Connection successful on attempt $i"
+              break
             }
+            Write-Host "Attempt ${i}/20: no response from $env:RPC_IP`:$env:RPC_PORT"
             Start-Sleep 5
           }
 
           if (-not $ok) {
             Write-Host ""
-            Write-Host "RPC worker TCP test failed - this may be normal"
+            Write-Host "WARNING: RPC worker not reachable on TCP. Gathering diagnostics..."
+            try {
+              Write-Host "--- tailscale status (main) ---"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>&1 | Select-Object -First 10
+              Write-Host "--- tailscale ping worker ---"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" ping "$env:RPC_HOSTNAME" -c 3 2>&1 | Select-Object -First 10
+              Write-Host "--- listening ports ---"
+              netstat -an | Select-String "50051|50052|8080" | Select-Object -First 10
+            }
+            catch {
+              Write-Host "Diagnostics unavailable: $_"
+            }
             Write-Host "Proceeding with server startup - RPC library handles reconnection"
           }
           else {
