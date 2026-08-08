@@ -418,7 +418,6 @@ jobs:
             $arguments = @(
               "--host", "0.0.0.0",
               "--port", "$env:RPC_PORT",
-              "--mem", "$rpcMemory",
               "--threads", "$threads",
               "--cache"
             )
@@ -1208,7 +1207,7 @@ jobs:
           $errorFile = "$env:RUNNER_TEMP\llama-server-error.log"
 
           $process = Start-Process `
-            -FilePath "llama" `
+            -FilePath "$env:LLAMA_DIR\llama.exe" `
             -ArgumentList $arguments `
             -WorkingDirectory $env:LLAMA_DIR `
             -RedirectStandardOutput $logFile `
