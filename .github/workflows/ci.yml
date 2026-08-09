@@ -1382,7 +1382,7 @@ jobs:
             "--flash-attn", "on",
             "--parallel", "1",
             "--batch-size", "64",
-            "--ubatch-size", "32",
+            "--ubatch-size", "32"
           )
 
           Write-Host "Launching command:"
