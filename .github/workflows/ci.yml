@@ -12,7 +12,7 @@ on:
       context:
         description: 'Context size (4096-131072)'
         required: false
-        default: '32768'
+        default: '16384'
         type: string
       session_timeout_minutes:
         description: 'Session timeout in minutes (5-360)'
@@ -1327,13 +1327,18 @@ jobs:
           Write-Host "Context:       $env:LLAMA_CONTEXT"
           Write-Host "RPC devices:   $env:RPC_IP`:$env:RPC_PORT (worker)"
           Write-Host "Threads:       $threads"
-          Write-Host "Tensor split:  1,1 (equal distribution)"
-          Write-Host "KV Cache K:    q8_0"
-          Write-Host "KV Cache V:    q8_0"
+          Write-Host "Tensor split:  auto (by free device memory)"
+          Write-Host "KV Cache K:    q4_0"
+          Write-Host "KV Cache V:    q4_0"
           Write-Host "Flash Attn:    ON"
           Write-Host "API port:      $env:LLAMA_PORT"
           Write-Host "================================================"
           Write-Host ""
+
+          $osMemory = Get-CimInstance Win32_OperatingSystem
+          $freeGB = [math]::Round($osMemory.FreePhysicalMemory / 1MB, 1)
+          $totalGB = [math]::Round($osMemory.TotalVisibleMemorySize / 1MB, 1)
+          Write-Host "Head RAM: $freeGB GB free / $totalGB GB total"
 
           $arguments = @(
             "serve",
@@ -1345,13 +1350,12 @@ jobs:
             "--rpc", "$env:RPC_IP`:$env:RPC_PORT",
             "--threads", "$threads",
             "--threads-batch", "$threads",
-            "--cache-type-k", "q8_0",
-            "--cache-type-v", "q8_0",
+            "--cache-type-k", "q4_0",
+            "--cache-type-v", "q4_0",
             "--flash-attn", "on",
             "--parallel", "1",
-            "--batch-size", "256",
-            "--ubatch-size", "128",
-            "--no-warmup"
+            "--batch-size", "64",
+            "--ubatch-size", "32",
           )
 
           Write-Host "Launching command:"
