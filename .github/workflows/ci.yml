@@ -1382,7 +1382,9 @@ jobs:
             "--flash-attn", "on",
             "--parallel", "1",
             "--batch-size", "64",
-            "--ubatch-size", "32"
+            "--ubatch-size", "32",
+            "--no-mmap",
+            "--log-file", "$env:RUNNER_TEMP\llama-server-native.log"
           )
 
           Write-Host "Launching command:"
@@ -1452,7 +1454,9 @@ jobs:
             }
             catch {
               if ($i % 15 -eq 0) {
-                Write-Host "[$($elapsed.ToString('mm\:ss'))] Waiting for API... (attempt $i)"
+                $osMem = Get-CimInstance Win32_OperatingSystem
+                $freeNow = [math]::Round($osMem.FreePhysicalMemory / 1MB, 1)
+                Write-Host "[$($elapsed.ToString('mm\:ss'))] Waiting for API... (attempt $i, head free RAM: $freeNow GB)"
                 
                 if (Test-Path $logFile) {
                   $recentLogs = Get-Content $logFile -Tail 2 -ErrorAction SilentlyContinue
@@ -1511,6 +1515,10 @@ jobs:
             max_tokens  = 20
             temperature = 0.1
           } | ConvertTo-Json -Depth 10
+
+          $osMemory = Get-CimInstance Win32_OperatingSystem
+          $freeGB = [math]::Round($osMemory.FreePhysicalMemory / 1MB, 1)
+          Write-Host "Head RAM before first inference: $freeGB GB free"
 
           $testResult = $null
           for ($attempt = 1; $attempt -le 3; $attempt++) {
@@ -1746,6 +1754,12 @@ jobs:
             Write-Host ""
             Write-Host "─── Output Log (last 50 lines) ───"
             Get-Content "$env:RUNNER_TEMP\llama-server.log" -Tail 50
+          }
+
+          if (Test-Path "$env:RUNNER_TEMP\llama-server-native.log") {
+            Write-Host ""
+            Write-Host "─── Native Log (last 150 lines) ───"
+            Get-Content "$env:RUNNER_TEMP\llama-server-native.log" -Tail 150
           }
 
           if (Test-Path "$env:RUNNER_TEMP\ngrok.log") {
