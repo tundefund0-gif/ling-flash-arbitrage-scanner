@@ -1357,7 +1357,7 @@ jobs:
           Write-Host "Tensor split:  auto (by free device memory)"
           Write-Host "KV Cache K:    q4_0"
           Write-Host "KV Cache V:    q4_0"
-          Write-Host "Flash Attn:    ON"
+          Write-Host "Flash Attn:    OFF (RPC compatibility)"
           Write-Host "API port:      $env:LLAMA_PORT"
           Write-Host "================================================"
           Write-Host ""
@@ -1379,7 +1379,7 @@ jobs:
             "--threads-batch", "$threads",
             "--cache-type-k", "q4_0",
             "--cache-type-v", "q4_0",
-            "--flash-attn", "on",
+            "--flash-attn", "off",
             "--parallel", "1",
             "--batch-size", "64",
             "--ubatch-size", "32",
@@ -1563,6 +1563,52 @@ jobs:
             }
             else {
               Write-Host "Server process exited (check logs above for crash reason)"
+              Write-Host ""
+
+              Write-Host "===== WINDOWS CRASH DIAGNOSTICS ====="
+              Write-Host ""
+
+              Write-Host "--- Application Event Log (Application Error / WerFault, last 6) ---"
+              try {
+                Get-WinEvent -FilterHashtable @{ LogName = "Application"; Id = 1000,1001 } -MaxEvents 6 -ErrorAction Stop |
+                  ForEach-Object {
+                    Write-Host ""
+                    Write-Host ("[{0}] {1}" -f $_.TimeCreated.ToString("HH:mm:ss"), $_.ProviderName)
+                    Write-Host ($_.Message -split "`r?`n" | Select-Object -First 12)
+                  }
+              }
+              catch {
+                Write-Host "(no Application Error events found: $($_.Exception.Message))"
+              }
+
+              Write-Host ""
+              Write-Host "--- Windows Error Reporting (WER) report files ---"
+              try {
+                $werDirs = @(
+                  "$env:ProgramData\Microsoft\Windows\WER\ReportArchive",
+                  "$env:ProgramData\Microsoft\Windows\WER\ReportQueue"
+                )
+                foreach ($dir in $werDirs) {
+                  if (Test-Path $dir) {
+                    $reports = Get-ChildItem $dir -Directory -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match "llama|ggml" } |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 3
+                    foreach ($rep in $reports) {
+                      Write-Host ""
+                      Write-Host "── $($rep.Name) ──"
+                      $sig = Join-Path $rep.FullName "Report.wer"
+                      if (Test-Path $sig) {
+                        Get-Content $sig | Select-Object -First 20
+                      }
+                    }
+                  }
+                }
+                if (-not $reports) { Write-Host "(no llama/ggml WER reports found)" }
+              }
+              catch {
+                Write-Host "WER scan: $($_.Exception.Message)"
+              }
+
               throw "API test failed: server process is not running"
             }
           }
