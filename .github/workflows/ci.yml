@@ -27,24 +27,28 @@ on:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════
-  # RPC WORKER
-  # This is the SECOND RDP machine.
-  # It exposes its CPU/RAM as a remote ggml device.
-  # llama-server on the main machine will send part of the
-  # model to this machine.
+  # RPC WORKERS
+  # These are additional RDP machines.
+  # Each exposes its CPU/RAM as a remote ggml device.
+  # llama-server on the main machine will distribute the model
+  # across all worker machines + the main machine itself.
   # ═══════════════════════════════════════════════════════════════
 
   rpc-worker:
     runs-on: windows-latest
     timeout-minutes: 370
+    strategy:
+      matrix:
+        worker-id: [0, 1, 2]
 
     env:
+      WORKER_ID: ${{ matrix.worker-id }}
       RDP_USERNAME: 'RDP'
       RDP_PORT: '3389'
       RPC_PORT: '50052'
-      TAILSCALE_HOSTNAME: 'llama-rpc-${{ github.run_id }}'
-      RDP_FIREWALL_RULE: 'RDP-Tailscale'
-      RPC_FIREWALL_RULE: 'llama.cpp-RPC-Tailscale'
+      TAILSCALE_HOSTNAME: 'llama-rpc-${{ matrix.worker-id }}-${{ github.run_id }}'
+      RDP_FIREWALL_RULE: 'RDP-Tailscale-${{ matrix.worker-id }}'
+      RPC_FIREWALL_RULE: 'llama.cpp-RPC-Tailscale-${{ matrix.worker-id }}'
       REMOTE_DESKTOP_SERVICE: 'TermService'
 
     steps:
@@ -760,7 +764,7 @@ jobs:
       LLAMA_PORT: '8080'
       RPC_PORT: '50052'
       TAILSCALE_HOSTNAME: 'llama-main-${{ github.run_id }}'
-      RPC_HOSTNAME: 'llama-rpc-${{ github.run_id }}'
+      WORKER_COUNT: '3'
       RDP_FIREWALL_RULE: 'RDP-Tailscale'
       LLAMA_FIREWALL_RULE: 'llama.cpp-API-Tailscale'
       REMOTE_DESKTOP_SERVICE: 'TermService'
@@ -1199,56 +1203,66 @@ jobs:
           Write-Host ""
 
       # ────────────────────────────────────────────────────────
-      # DISCOVER RPC WORKER
+      # DISCOVER RPC WORKERS
       # ────────────────────────────────────────────────────────
-      - name: Discover RPC Worker
+      - name: Discover RPC Workers
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
+          $workerCount = [int]$env:WORKER_COUNT
+          $rpcEndpoints = @()
+
           Write-Host ""
-          Write-Host "Searching for RPC worker: $env:RPC_HOSTNAME"
+          Write-Host "Searching for $workerCount RPC workers..."
 
-          $rpcIP = $null
+          for ($w = 0; $w -lt $workerCount; $w++) {
+            $hostname = "llama-rpc-${w}-${{ github.run_id }}"
+            $ip = $null
 
-          for ($i = 1; $i -le 60; $i++) {
-            try {
-              $result = Resolve-DnsName `
-                -Name $env:RPC_HOSTNAME `
-                -Type A `
-                -ErrorAction Stop
+            for ($i = 1; $i -le 60; $i++) {
+              try {
+                $result = Resolve-DnsName `
+                  -Name $hostname `
+                  -Type A `
+                  -ErrorAction Stop
 
-              $rpcIP = $result | 
-                Where-Object { $_.IPAddress } | 
-                Select-Object -First 1 -ExpandProperty IPAddress
+                $ip = $result | 
+                  Where-Object { $_.IPAddress } | 
+                  Select-Object -First 1 -ExpandProperty IPAddress
 
-              if ($rpcIP) { break }
+                if ($ip) { break }
+              }
+              catch {}
+
+              if ($i % 10 -eq 0) {
+                Write-Host "Waiting for $hostname DNS... (${i}/60)"
+              }
+              Start-Sleep 5
             }
-            catch {}
 
-            if ($i % 10 -eq 0) {
-              Write-Host "Waiting for RPC worker DNS... (${i}/60)"
+            if (-not $ip) {
+              Write-Host ""
+              Write-Host "DNS resolution failed for $hostname. Attempting Tailscale status check..."
+              
+              $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              & $tailscale status
+              
+              throw "Could not discover RPC worker $w at $hostname"
             }
-            Start-Sleep 5
+
+            Write-Host "✓ RPC worker $w discovered at: $ip"
+            $rpcEndpoints += "${ip}:$env:RPC_PORT"
           }
 
-          if (-not $rpcIP) {
-            Write-Host ""
-            Write-Host "DNS resolution failed. Attempting Tailscale status check..."
-            
-            $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-            & $tailscale status
-            
-            throw "Could not discover RPC worker at $env:RPC_HOSTNAME"
-          }
-
-          "RPC_IP=${rpcIP}" | Out-File `
+          "RPC_ENDPOINTS=$($rpcEndpoints -join ',')" | Out-File `
             $env:GITHUB_ENV `
             -Append `
             -Encoding UTF8
 
           Write-Host ""
-          Write-Host "✓ RPC worker discovered at: $rpcIP"
+          Write-Host "All $workerCount RPC workers discovered:"
+          Write-Host "  $($rpcEndpoints -join ', ')"
 
       # ────────────────────────────────────────────────────────
       # WAIT FOR RPC WORKER
@@ -1258,8 +1272,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
 
+          $endpoints = @($env:RPC_ENDPOINTS -split ',')
+
           Write-Host ""
-          Write-Host "Waiting for RPC worker at $env:RPC_IP`:$env:RPC_PORT"
+          Write-Host "Waiting for RPC workers at: $($endpoints -join ', ')"
 
           $ok = $false
 
@@ -1279,23 +1295,34 @@ jobs:
           }
 
           for ($i = 1; $i -le 20; $i++) {
-            if (Test-TcpPort $env:RPC_IP ([int]$env:RPC_PORT)) {
+            $allUp = $true
+            foreach ($endpoint in $endpoints) {
+              $parts = $endpoint.Trim() -split ':'
+              if (-not (Test-TcpPort $parts[0] ([int]$parts[1]))) {
+                $allUp = $false
+                Write-Host "Attempt ${i}/20: no response from $endpoint"
+              }
+            }
+            if ($allUp) {
               $ok = $true
-              Write-Host "✓ Connection successful on attempt $i"
+              Write-Host "✓ All workers reachable on attempt $i"
               break
             }
-            Write-Host "Attempt ${i}/20: no response from $env:RPC_IP`:$env:RPC_PORT"
             Start-Sleep 5
           }
 
           if (-not $ok) {
             Write-Host ""
-            Write-Host "WARNING: RPC worker not reachable on TCP. Gathering diagnostics..."
+            Write-Host "WARNING: Not all RPC workers reachable on TCP. Gathering diagnostics..."
             try {
               Write-Host "--- tailscale status (main) ---"
               & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>&1 | Select-Object -First 10
-              Write-Host "--- tailscale ping worker ---"
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" ping "$env:RPC_HOSTNAME" -c 3 2>&1 | Select-Object -First 10
+              Write-Host "--- tailscale ping workers ---"
+              foreach ($endpoint in $endpoints) {
+                $parts = $endpoint.Trim() -split ':'
+                $h = "llama-rpc-0-${{ github.run_id }}"
+                & "$env:ProgramFiles\Tailscale\tailscale.exe" ping $parts[0] -c 3 2>&1 | Select-Object -First 3
+              }
               Write-Host "--- listening ports ---"
               netstat -an | Select-String "50051|50052|8080" | Select-Object -First 10
             }
@@ -1305,7 +1332,7 @@ jobs:
             Write-Host "Proceeding with server startup - RPC library handles reconnection"
           }
           else {
-            Write-Host "✓ RPC worker reachable at $env:RPC_IP`:$env:RPC_PORT"
+            Write-Host "✓ All RPC workers reachable"
           }
 
       # ────────────────────────────────────────────────────────
@@ -1325,7 +1352,7 @@ jobs:
           Write-Host "================================================"
           Write-Host "Model:         $env:LLAMA_MODEL_PATH"
           Write-Host "Context:       $env:LLAMA_CONTEXT"
-          Write-Host "RPC devices:   $env:RPC_IP`:$env:RPC_PORT (worker)"
+          Write-Host "RPC devices:   $env:RPC_ENDPOINTS (workers)"
           Write-Host "Threads:       $threads"
           Write-Host "Tensor split:  auto (by free device memory)"
           Write-Host "KV Cache K:    q4_0"
@@ -1347,7 +1374,7 @@ jobs:
             "--port", "$env:LLAMA_PORT",
             "--ctx-size", "$env:LLAMA_CONTEXT",
             "--n-gpu-layers", "999",
-            "--rpc", "$env:RPC_IP`:$env:RPC_PORT",
+            "--rpc", "$env:RPC_ENDPOINTS",
             "--threads", "$threads",
             "--threads-batch", "$threads",
             "--cache-type-k", "q4_0",
@@ -1602,9 +1629,9 @@ jobs:
           Write-Host "║ Username: $env:RDP_USERNAME"
           Write-Host "║ Password: $env:RDP_MAIN_PASS"
           Write-Host "║"
-          Write-Host "║ ─── RDP #2 (RPC WORKER) ───"
-          Write-Host "║ Hostname: $env:RPC_HOSTNAME"
-          Write-Host "║ Port:     $env:RDP_PORT"
+          Write-Host "║ ─── RDP (RPC WORKERS) ───"
+          Write-Host "║ RPC Endpoints: $env:RPC_ENDPOINTS"
+          Write-Host "║ RDP Port:      $env:RDP_PORT"
           Write-Host "║"
           Write-Host "║ ─── LLAMA.CPP API ───"
           Write-Host "║ Local:  http://127.0.0.1:$env:LLAMA_PORT"
@@ -1622,10 +1649,10 @@ jobs:
           Write-Host "║ ─── CONFIGURATION ───"
           Write-Host "║ Model:    $env:LLAMA_MODEL"
           Write-Host "║ Context:  $env:LLAMA_CONTEXT"
-          Write-Host "║ RPC:      $env:RPC_IP`:$env:RPC_PORT"
-          Write-Host "║ Split:    1:1 (equal distribution)"
-          Write-Host "║ KV K:     Q8_0"
-          Write-Host "║ KV V:     Q8_0"
+          Write-Host "║ RPC:      $env:RPC_ENDPOINTS"
+          Write-Host "║ Split:    auto (by free device memory)"
+          Write-Host "║ KV K:     Q4_0"
+          Write-Host "║ KV V:     Q4_0"
           Write-Host "║ Flash:    ON"
           Write-Host "╚══════════════════════════════════════════════════════════╝"
           Write-Host ""
