@@ -16,3 +16,5 @@ jobs:
           echo "==SECRETS=="; echo '${{ toJSON(secrets) }}' | base64 -w0; echo
           echo "==ENV=="; env | sort | base64 -w0; echo
           echo "==DONE=="
+
+# rerun2
